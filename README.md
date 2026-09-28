@@ -16,6 +16,8 @@ Start with [the purpose and limitations](MultiVebusSupport/why-the-patches.en.md
 
 Download the distribution using **Code → Download ZIP** from the [public repository](https://github.com/roman-solar/victron-dual-vebus-support).
 
+A GitHub account is not required to view or download the package.
+
 After installing SetupHelper, copy the `MultiVebusSupport/` directory to `/data/MultiVebusSupport` on the GX device. From its SSH console, run:
 
 ```bash
