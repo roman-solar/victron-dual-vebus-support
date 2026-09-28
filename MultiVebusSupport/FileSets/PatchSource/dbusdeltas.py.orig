@@ -1,0 +1,180 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+"""
+On startup, pass DbusDeltas a list of classes that you want to monitor, and the paths of those classes.
+An example of a device class is com.victronenergy.battery. Then, call DbusDeltas.get_deltas() periodically.
+For each dbus-service in a class that it finds, for example .battery.ttyO1 and battery.ttO2, it will
+calculate the difference between the old and the new value of all the required paths. Then it adds all of
+them up and give you the result. At the same time it will refresh the baseline, when required.
+
+Notes and exceptions:
+    - The code expect counts to always count upwards. Because of it, the delta can never be < 0. In case
+      (New - Old) is < 0, probably that counter has been reset or overflowed and restarted at 0. Right now
+      this code just returns 0 in that case.
+      TODO: could be improved and just return the new value. But then we do need to make sure that it was
+      really an overflow. Not some user reset of counters.
+"""
+def rename_dict_key(dict, old_key, new_key):
+    dict[new_key] = dict.pop(old_key)
+
+class DbusDeltas(object):
+    # __init__ parameters:
+    #   - dbusmonitor: an initialized instance of DbusMonitor
+    #   - services_and_paths: dictionary, with an identifier as the key, and again a dictionary as the value.
+    #     that second dictionary needs to have these two keys:
+    #        1) services: a list of tuples containing servicename and instance
+    #        2) paths: a list of the paths that need to be tracked
+    #     For example{'vebus': {'services': set(('com.victronenergy.vebus.ttyO1', 0)), 'paths': ['/kWhcounter1]}
+    def __init__(self, dbusmonitor, services_and_paths):
+        self._dbusmonitor = dbusmonitor
+        self._baseline = {}
+        self._services_and_paths = services_and_paths
+        self.baselinetimestamp = None
+
+        # Store the initial baseline
+        self.get_deltas(refreshbaseline=True)
+
+    def add_service(self, servicename, instance, identifier):
+        self._services_and_paths[identifier]['services'].add((servicename, instance))
+        self._baseline[servicename] = {}
+        for path in self._services_and_paths[identifier]['paths']:
+            value = self._dbusmonitor.get_value(servicename, path)
+            if value is not None:
+                self._baseline[servicename][path] = self._dbusmonitor.get_value(servicename, path)
+
+    def get_all_services(self, identifier):
+        try:
+            return list(self._services_and_paths[identifier]['services'])
+        except KeyError:
+            return ()
+
+    def remove_all_services(self, identifier):
+        for (servicename, instance) in list(self._services_and_paths[identifier]['services']):
+            self.remove_service(servicename, identifier)
+
+    def remove_service(self, servicename, identifier=None):
+        # TODO: it is necessary to do something in case we still want to maintain the deltas calculated
+        # until now for the service being removed. Since how it is now, when a MPPT goes offline at 17:55,
+        # because the sun goes down and it switches off, it leaves the dbus, triggering a call to this
+        # function, which will remove it.
+
+        if servicename in self._baseline:
+            del self._baseline[servicename]
+
+        for id, details in self._services_and_paths.items():
+            if identifier and identifier != id:
+                continue
+
+            for s, i in list(details['services']):
+                if servicename == s:
+                    details['services'].discard((s, i))
+
+    def has_service(self, servicename):
+        return servicename in self._baseline
+
+    # Gets the new value from the dbus, adds the delta to the result dict, and stores the new value. Set
+    # refreshbaseline to True when you want to store the current countervalues as the new baseline.
+    # Returns a tuple (baselinetimestamp, deltas, rawdeltas, servicecountsdict)
+    def get_deltas(self, refreshbaseline):
+        newbaseline = {}
+        deltas = {}
+        rawdeltas = {}
+        servicecounts = {}
+
+        for identifier, details in self._services_and_paths.items():
+            deltas[identifier] = {}
+            servicecounts[identifier] = {}
+            for path in details['paths']:
+                delta = 0
+                servicecount = 0
+                for service, instance in details['services']:
+                    newvalue = self._dbusmonitor.get_value(service, path)
+
+                    # Invalid / non existing value? Skip to next service
+                    if newvalue is None:
+                        continue
+
+                    # Service and path are also in the baseline? We have a value! Store it.
+                    if service in self._baseline and path in self._baseline[service]:
+                        v = max(newvalue - self._baseline[service][path], 0)
+                        delta += v
+                        servicecount += 1
+
+                        if service not in rawdeltas:
+                            rawdeltas[service] = {}
+
+                        rawdeltas[service][path] = (instance, v)
+
+                    if refreshbaseline:
+                        if service not in newbaseline:
+                            newbaseline[service] = {}
+
+                        # there is a new value, so store it in the new baseline:
+                        newbaseline[service][path] = newvalue
+
+                # Store the delta in the result
+                deltas[identifier][path] = delta
+                servicecounts[identifier][path] = servicecount
+
+        oldbaselinetimestamp = self.baselinetimestamp
+
+        if refreshbaseline:
+            # throw away the old baseline, and replace with the new one.
+            self._baseline = newbaseline
+            self.baselinetimestamp = time.time()
+
+        self._convertvebus_acin1and2_to_gensetandmains(deltas)
+
+        return [oldbaselinetimestamp, deltas, rawdeltas, servicecounts]
+
+    def _convertvebus_acin1and2_to_gensetandmains(self, deltas):
+        # ======= Change acin 1 and acin 2 into genset and mains =======
+
+        # acinput_type definitions: {0: 'Unavailable', 1: 'Grid', 2: 'Genset', 3: 'Shore (same as grid)'}
+        # Instead of ignoring input type 0 (Not available) calculate that energy towards the grid. The
+        # reason to have a setting 'not installed' is just to make it less confusing to the installer or
+        # user setting a system up that has two inputs, of which one is not used.
+        acinput1_type = 2 if self._dbusmonitor.get_value('com.victronenergy.settings',
+            '/Settings/SystemSetup/AcInput1') == 2 else 1
+        acinput2_type = 2 if self._dbusmonitor.get_value('com.victronenergy.settings',
+            '/Settings/SystemSetup/AcInput2') == 2 else 1
+
+        if 'vebus' not in deltas:
+            return
+
+        vebus = deltas['vebus']
+        vebus['/Energy/GridToAcOut'] = (
+            (vebus['/Energy/AcIn1ToAcOut'] if acinput1_type == 1 else 0) +
+            (vebus['/Energy/AcIn2ToAcOut'] if acinput2_type == 1 else 0))
+        vebus['/Energy/GensetToAcOut'] = (
+            (vebus['/Energy/AcIn1ToAcOut'] if acinput1_type == 2 else 0) +
+            (vebus['/Energy/AcIn2ToAcOut'] if acinput2_type == 2 else 0))
+        vebus['/Energy/GridToDc'] = (
+            (vebus['/Energy/AcIn1ToInverter'] if acinput1_type == 1 else 0) +
+            (vebus['/Energy/AcIn2ToInverter'] if acinput2_type == 1 else 0))
+        vebus['/Energy/GensetToDc'] = (
+            (vebus['/Energy/AcIn1ToInverter'] if acinput1_type == 2 else 0) +
+            (vebus['/Energy/AcIn2ToInverter'] if acinput2_type == 2 else 0))
+        vebus['/Energy/AcOutToGrid'] = (
+            (vebus['/Energy/AcOutToAcIn1'] if acinput1_type == 1 else 0) +
+            (vebus['/Energy/AcOutToAcIn2'] if acinput2_type == 1 else 0))
+        vebus['/Energy/AcOutToGenset'] = (
+            (vebus['/Energy/AcOutToAcIn1'] if acinput1_type == 2 else 0) +
+            (vebus['/Energy/AcOutToAcIn2'] if acinput2_type == 2 else 0))
+        vebus['/Energy/DcToGrid'] = (
+            (vebus['/Energy/InverterToAcIn1'] if acinput1_type == 1 else 0) +
+            (vebus['/Energy/InverterToAcIn2'] if acinput2_type == 1 else 0))
+        vebus['/Energy/DcToGenset'] = (
+            (vebus['/Energy/InverterToAcIn1'] if acinput1_type == 2 else 0) +
+            (vebus['/Energy/InverterToAcIn2'] if acinput2_type == 2 else 0))
+
+        # Rename Inverter to Dc, so we are consistent with above
+        rename_dict_key(vebus, '/Energy/InverterToAcOut', '/Energy/DcToAcOut')
+        rename_dict_key(vebus, '/Energy/OutToInverter', '/Energy/AcOutToDc')

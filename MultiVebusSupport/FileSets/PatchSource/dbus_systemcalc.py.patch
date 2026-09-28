@@ -1,0 +1,93 @@
+--- /mnt/data/MultiVebusSupport-work/src/dbus_systemcalc.py.orig	2026-09-16 18:38:24.997084508 +0000
++++ /mnt/data/MultiVebusSupport-work/src/dbus_systemcalc.py	2026-09-16 18:38:25.454986625 +0000
+@@ -30,6 +30,7 @@
+ 	STATE_DISCHARGING = 2
+ 	BATSERVICE_DEFAULT = 'default'
+ 	BATSERVICE_NOBATTERY = 'nobattery'
++	MULTI_VEBUS_CONFIG = '/data/setupOptions/MultiVebusSupport/config.json'
+ 	def __init__(self):
+ 		# Why this dummy? Because DbusMonitor expects these values to be there, even though we don't
+ 		# need them. So just add some dummy data. This can go away when DbusMonitor is more generic.
+@@ -128,6 +129,16 @@
+ 				'/Ac/L2/Current': dummy,
+ 				'/Ac/L3/Current': dummy,
+ 				'/StarterVoltage': dummy},
++			'com.victronenergy.acload' : {
++				'/Connected': dummy,
++				'/ProductName': dummy,
++				'/Mgmt/Connection': dummy,
++				'/Ac/L1/Power': dummy,
++				'/Ac/L2/Power': dummy,
++				'/Ac/L3/Power': dummy,
++				'/Ac/L1/Current': dummy,
++				'/Ac/L2/Current': dummy,
++				'/Ac/L3/Current': dummy},
+ 			'com.victronenergy.settings' : {
+ 				'/Settings/SystemSetup/AcInput1' : dummy,
+ 				'/Settings/SystemSetup/AcInput2' : dummy,
+@@ -211,6 +222,8 @@
+ 			}
+ 		}
+ 
++		self._acload_authoritative_instance = self._load_acload_authoritative_instance()
++
+ 		self._modules = [
+ 			delegates.Multi(),
+ 			delegates.HubTypeSelect(),
+@@ -383,6 +396,27 @@
+ 
+ 		self._changed = True
+ 
++	def _load_acload_authoritative_instance(self):
++		try:
++			with open(self.MULTI_VEBUS_CONFIG, 'r') as f:
++				config = json.load(f).get('ac_load_authoritative', {})
++			if config.get('enabled') is not True:
++				return None
++			return int(config['device_instance'])
++		except (OSError, AttributeError, KeyError, TypeError, ValueError):
++			return None
++
++	def _get_authoritative_acload_service(self):
++		# Only configure this for a meter that measures the complete system AC
++		# load. A meter on an individual branch must use the normal calculation.
++		if self._acload_authoritative_instance is None:
++			return None
++
++		for service, instance in self._get_connected_service_list('com.victronenergy.acload').items():
++			if instance == self._acload_authoritative_instance:
++				return service
++		return None
++
+ 	def _create_dbus_monitor(self, *args, **kwargs):
+ 		raise Exception("This function should be overridden")
+ 
+@@ -1021,12 +1055,26 @@
+ 				a = _safemax(0, a)
+ 			newvalues['/Ac/ConsumptionOnOutput/%s/Power' % phase] = c
+ 			newvalues['/Ac/ConsumptionOnOutput/%s/Current' % phase] = a
+-			newvalues['/Ac/Consumption/%s/Power' % phase] = _safeadd(consumption[phase], c)
+-			newvalues['/Ac/Consumption/%s/Current' % phase] = _safeadd(currentconsumption[phase], a)
++			newvalues['/Ac/Consumption/%s/Power' % phase] = (
++				_safeadd(consumption[phase], c) if has_ac_in_system else c)
++			newvalues['/Ac/Consumption/%s/Current' % phase] = (
++				_safeadd(currentconsumption[phase], a) if has_ac_in_system else a)
+ 			if has_ac_in_system:
+ 				newvalues['/Ac/ConsumptionOnInput/%s/Power' % phase] = consumption[phase]
+ 				newvalues['/Ac/ConsumptionOnInput/%s/Current' % phase] = currentconsumption[phase]
+ 
++		# A dedicated load-boundary meter can be authoritative for live total
++		# consumption. Missing values fall back to the normal calculation above.
++		acload_service = self._get_authoritative_acload_service()
++		if acload_service is not None:
++			for phase in consumption:
++				p = self._dbusmonitor.get_value(acload_service, '/Ac/%s/Power' % phase)
++				a = self._dbusmonitor.get_value(acload_service, '/Ac/%s/Current' % phase)
++				if p is not None:
++					newvalues['/Ac/Consumption/%s/Power' % phase] = p
++				if a is not None:
++					newvalues['/Ac/Consumption/%s/Current' % phase] = a
++
+ 		self._compute_number_of_phases('/Ac/Consumption', newvalues)
+ 		self._compute_number_of_phases('/Ac/ConsumptionOnOutput', newvalues)
+ 		self._compute_number_of_phases('/Ac/ConsumptionOnInput', newvalues)

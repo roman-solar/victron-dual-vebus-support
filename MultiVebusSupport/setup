@@ -1,0 +1,114 @@
+#!/bin/bash
+
+source "/data/SetupHelper/HelperResources/IncludeHelpers"
+
+if [ "$scriptAction" == 'NONE' ]; then
+    standardActionPrompt
+fi
+
+configFile="$setupOptionsDir/config.json"
+
+compilePatchedPython ()
+{
+    local name
+    for name in dbus_systemcalc.py dbusdeltas.py kwhdeltas.py; do
+        local candidate="$tempFileDir/$name.patchedForInstall"
+        if [ ! -f "$candidate" ]; then
+            setInstallFailed $EXIT_PATCH_ERROR "missing patched candidate $candidate"
+            return
+        fi
+        if ! python3 -m py_compile "$candidate"; then
+            setInstallFailed $EXIT_PATCH_ERROR "Python compile failed for $name"
+            return
+        fi
+    done
+}
+
+restartVrmlogger ()
+{
+    local service="/service/vrmlogger"
+    local oldPid newPid attempt
+
+    if [ ! -d "$service" ]; then
+        setInstallFailed $EXIT_PATCH_ERROR "vrmlogger service not found"
+        return
+    fi
+
+    oldPid=$(svstat "$service" 2>/dev/null | sed -n 's/.*(pid \([0-9][0-9]*\)).*/\1/p')
+    logMessage "restarting vrmlogger"
+    svc -t "$service"
+
+    attempt=0
+    while [ $attempt -lt 15 ]; do
+        sleep 1
+        newPid=$(svstat "$service" 2>/dev/null | sed -n 's/.*(pid \([0-9][0-9]*\)).*/\1/p')
+        if [ -n "$newPid" ] && { [ -z "$oldPid" ] || [ "$newPid" != "$oldPid" ]; }; then
+            logMessage "vrmlogger restarted (pid $newPid)"
+            return
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    logMessage "vrmlogger restart not confirmed; retrying"
+    svc -t "$service"
+
+    attempt=0
+    while [ $attempt -lt 15 ]; do
+        sleep 1
+        newPid=$(svstat "$service" 2>/dev/null | sed -n 's/.*(pid \([0-9][0-9]*\)).*/\1/p')
+        if [ -n "$newPid" ] && { [ -z "$oldPid" ] || [ "$newPid" != "$oldPid" ]; }; then
+            logMessage "vrmlogger restarted (pid $newPid)"
+            return
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    setInstallFailed $EXIT_PATCH_ERROR "vrmlogger restart could not be confirmed"
+}
+
+if [ "$scriptAction" == 'INSTALL' ] && ! $installFailed; then
+    if [ ! -f "$configFile" ]; then
+        mkdir -p "$setupOptionsDir"
+        cp "$scriptDir/config.example.json" "$configFile"
+        logMessage "created persistent configuration $configFile"
+    fi
+
+    # Known source hashes identify versions that were actually validated, but
+    # are not a hard version lock. On newer Venus OS versions the package is
+    # allowed only when the same patches pass zero-fuzz forward/reverse checks,
+    # produce the expected package markers and compile as Python.
+    if ! "$scriptDir/tools/preflight.sh"; then
+        setInstallFailed $EXIT_PATCH_ERROR \
+            "structural compatibility preflight failed; upstream files were not modified"
+    fi
+
+    if ! $installFailed; then
+        compilePatchedPython
+    fi
+
+    if ! $installFailed; then
+        installAllFiles
+    fi
+
+    if ! $installFailed; then
+        restartVrmlogger
+    fi
+
+    endScript
+fi
+
+if [ "$scriptAction" == 'UNINSTALL' ]; then
+    uninstallAllFiles
+
+    if ! $uninstallFailed; then
+        restartVrmlogger
+    fi
+
+    # Files have already been restored above. Prevent endScript from repeating
+    # the same restore operation while retaining its package bookkeeping.
+    fileListAll=()
+    [ -f "$installedFilesList" ] && : > "$installedFilesList"
+    endScript
+fi
+
+endScript

@@ -1,0 +1,139 @@
+--- /mnt/data/MultiVebusSupport-work/src/kwhdeltas.py.orig	2026-09-16 18:38:24.998909203 +0000
++++ /mnt/data/MultiVebusSupport-work/src/kwhdeltas.py	2026-09-16 18:38:25.455484638 +0000
+@@ -89,6 +89,9 @@
+ class KwhDeltas:
+     def __init__(self):
+         self._battery_service = None
++        self._cross_vebus_previous = {}
++        self._cross_vebus_grid = 0
++        self._cross_vebus_genset = 0
+         self._store = {
+             'vebus': {
+                 'services': set(), 'class': 'com.victronenergy.vebus',
+@@ -330,6 +333,92 @@
+         for service, instance in services:
+             self._add_pvinverter_service(service, instance)
+ 
++    @staticmethod
++    def _max_cross_vebus_transfer(sources, loads):
++        if not sources or not loads:
++            return 0
++
++        source_total = sum(sources.values())
++        load_total = sum(loads.values())
++        services = set(sources) | set(loads)
++        largest_self_pair = max(
++            sources.get(service, 0) + loads.get(service, 0)
++            for service in services)
++
++        # Exclude conversion that occurs within the same VE.Bus service.
++        return max(0, min(
++            source_total,
++            load_total,
++            source_total + load_total - largest_self_pair))
++
++    def _update_cross_vebus_transfer(self, rawdeltas, refreshbaseline):
++        current = {}
++        instances = {}
++
++        for service, values in rawdeltas.items():
++            if not service.startswith('com.victronenergy.vebus.'):
++                continue
++
++            instance = next((item[0] for item in values.values()), None)
++            if instance is None:
++                continue
++            instances[service] = instance
++
++            def raw(path):
++                item = values.get(path)
++                return item[1] if item is not None else 0
++
++            current[service] = {
++                'in1': raw('/Energy/AcIn1ToInverter'),
++                'in2': raw('/Energy/AcIn2ToInverter'),
++                'out': raw('/Energy/InverterToAcOut'),
++            }
++
++        interval = {}
++        for service, values in current.items():
++            previous = self._cross_vebus_previous.get(service, {})
++            interval[service] = {}
++            for key, value in values.items():
++                old = previous.get(key, 0)
++                interval[service][key] = value - old if value >= old else value
++
++        grid_sources = {}
++        genset_sources = {}
++        loads = {}
++
++        for service, values in interval.items():
++            if values['out'] > 0:
++                loads[service] = values['out']
++
++            instance = instances[service]
++            for input_number, key in ((1, 'in1'), (2, 'in2')):
++                source = values[key]
++                if source <= 0:
++                    continue
++
++                role = self._dbusdeltas.get_vebus_input_type(instance, input_number)
++                target = grid_sources if role == 1 else genset_sources
++                target[service] = target.get(service, 0) + source
++
++        # rawdeltas are cumulative from the current VRM baseline. Match only
++        # increments from the same vrmlogger sampling interval, then accumulate
++        # the matched transfer for that baseline.
++        self._cross_vebus_grid += self._max_cross_vebus_transfer(
++            grid_sources, loads)
++        self._cross_vebus_genset += self._max_cross_vebus_transfer(
++            genset_sources, loads)
++
++        result = self._cross_vebus_grid, self._cross_vebus_genset
++
++        if refreshbaseline:
++            self._cross_vebus_previous = {}
++            self._cross_vebus_grid = 0
++            self._cross_vebus_genset = 0
++        else:
++            self._cross_vebus_previous = current
++
++        return result
++
+     # Core of this class. Performs calculations and returns all kwhdeltas in a dict which is formatted to
+     # be sent straight to VRM.
+     def getdeltas(self, refreshbaseline):
+@@ -344,6 +433,12 @@
+ 
+         baselinetimestamp, deltas, rawdeltas, servicecounts = self._dbusdeltas.get_deltas(refreshbaseline)
+ 
++        if self._dbusdeltas.cross_vebus_passthrough_enabled:
++            cross_grid, cross_genset = self._update_cross_vebus_transfer(
++                rawdeltas, refreshbaseline)
++        else:
++            cross_grid = cross_genset = 0
++
+         grid_in = deltas['grid']['/Ac/Energy/Forward']
+         grid_out = deltas['grid']['/Ac/Energy/Reverse']
+         genset_in = deltas['genset']['/Ac/Energy/Forward']
+@@ -488,6 +583,20 @@
+ 
+         bat_in, dc_to_acout, bat_to_acout = _distribute(bat_in, dc_to_acout)
+         bat_in, dc_to_acgrid, bat_to_acin = _distribute(bat_in, dc_to_acgrid)
++
++        # Energy entering the shared DC bus through one VE.Bus service can feed
++        # AC-out of another service in the same sampling interval. Reclassify
++        # only the matching virtual battery charge/discharge loop.
++        direct_grid = min(cross_grid, grid_to_bat, bat_to_acout)
++        grid_to_bat -= direct_grid
++        grid_to_consumption += direct_grid
++        bat_to_acout -= direct_grid
++
++        direct_genset = min(cross_genset, genset_to_bat, bat_to_acout)
++        genset_to_bat -= direct_genset
++        genset_to_consumption += direct_genset
++        bat_to_acout -= direct_genset
++
+         bat_to_consumption += bat_to_acout
+         if has_dc_system:
+             bat_to_consumption += bat_in

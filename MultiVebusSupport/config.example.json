@@ -1,0 +1,10 @@
+{
+  "ac_load_authoritative": {
+    "enabled": false,
+    "device_instance": 0
+  },
+  "vebus_input_overrides": {},
+  "cross_vebus_passthrough": {
+    "enabled": false
+  }
+}

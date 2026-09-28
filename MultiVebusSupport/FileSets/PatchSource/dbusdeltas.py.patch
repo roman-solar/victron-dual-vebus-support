@@ -1,0 +1,186 @@
+--- /mnt/data/MultiVebusSupport-work/src/dbusdeltas.py.orig	2026-09-16 18:38:24.997996560 +0000
++++ /mnt/data/MultiVebusSupport-work/src/dbusdeltas.py	2026-09-16 18:38:25.455149325 +0000
+@@ -1,6 +1,7 @@
+ #!/usr/bin/env python
+ # -*- coding: utf-8 -*-
+ 
++import json
+ import logging
+ import time
+ 
+@@ -38,9 +39,81 @@
+         self._services_and_paths = services_and_paths
+         self.baselinetimestamp = None
+ 
++        self._config = self._load_config()
++        self._vebus_input_overrides = self._load_vebus_input_overrides(
++            self._config.get('vebus_input_overrides', {}))
++        self.cross_vebus_passthrough_enabled = (
++            self._config.get('cross_vebus_passthrough', {}).get('enabled') is True)
++
+         # Store the initial baseline
+         self.get_deltas(refreshbaseline=True)
+ 
++    @staticmethod
++    def _load_config():
++        path = '/data/setupOptions/MultiVebusSupport/config.json'
++        try:
++            with open(path, 'r') as f:
++                config = json.load(f)
++        except FileNotFoundError:
++            logger.info("Multi-VE.Bus config file not found: %s", path)
++            return {}
++        except (OSError, ValueError, TypeError) as e:
++            logger.warning("Unable to load multi-VE.Bus config from %s: %s", path, e)
++            return {}
++
++        if not isinstance(config, dict):
++            logger.warning("Ignoring multi-VE.Bus config: top-level JSON value is not an object")
++            return {}
++        return config
++
++    @staticmethod
++    def _load_vebus_input_overrides(data):
++        if not isinstance(data, dict):
++            logger.warning("Ignoring VE.Bus AC input overrides: value is not an object")
++            return {}
++
++        overrides = {}
++        for instance, inputs in data.items():
++            if not isinstance(inputs, dict):
++                logger.warning("Ignoring VE.Bus override for DeviceInstance %s: value is not an object", instance)
++                continue
++
++            parsed_inputs = {}
++            for input_number, role in inputs.items():
++                try:
++                    input_number = int(input_number)
++                    role = int(role)
++                except (TypeError, ValueError):
++                    logger.warning("Ignoring invalid VE.Bus override %s/%s=%r", instance, input_number, role)
++                    continue
++
++                if input_number not in (1, 2) or role not in (1, 2):
++                    logger.warning("Ignoring unsupported VE.Bus override %s/%s=%r", instance, input_number, role)
++                    continue
++
++                parsed_inputs[input_number] = role
++
++            if parsed_inputs:
++                try:
++                    instance = int(instance)
++                except (TypeError, ValueError):
++                    logger.warning("Ignoring VE.Bus override with invalid DeviceInstance: %r", instance)
++                    continue
++                overrides[instance] = parsed_inputs
++
++        if overrides:
++            logger.info("Loaded VE.Bus AC input overrides: %s", overrides)
++        return overrides
++
++    def get_vebus_input_type(self, instance, input_number):
++        override = self._vebus_input_overrides.get(instance, {}).get(input_number)
++        if override is not None:
++            return override
++
++        path = '/Settings/SystemSetup/AcInput%s' % input_number
++        return 2 if self._dbusmonitor.get_value(
++            'com.victronenergy.settings', path) == 2 else 1
++
+     def add_service(self, servicename, instance, identifier):
+         self._services_and_paths[identifier]['services'].add((servicename, instance))
+         self._baseline[servicename] = {}
+@@ -130,50 +203,58 @@
+             self._baseline = newbaseline
+             self.baselinetimestamp = time.time()
+ 
+-        self._convertvebus_acin1and2_to_gensetandmains(deltas)
++        self._convertvebus_acin1and2_to_gensetandmains(deltas, rawdeltas)
+ 
+         return [oldbaselinetimestamp, deltas, rawdeltas, servicecounts]
+ 
+-    def _convertvebus_acin1and2_to_gensetandmains(self, deltas):
++    def _convertvebus_acin1and2_to_gensetandmains(self, deltas, rawdeltas):
+         # ======= Change acin 1 and acin 2 into genset and mains =======
+ 
+-        # acinput_type definitions: {0: 'Unavailable', 1: 'Grid', 2: 'Genset', 3: 'Shore (same as grid)'}
+-        # Instead of ignoring input type 0 (Not available) calculate that energy towards the grid. The
+-        # reason to have a setting 'not installed' is just to make it less confusing to the installer or
+-        # user setting a system up that has two inputs, of which one is not used.
+-        acinput1_type = 2 if self._dbusmonitor.get_value('com.victronenergy.settings',
+-            '/Settings/SystemSetup/AcInput1') == 2 else 1
+-        acinput2_type = 2 if self._dbusmonitor.get_value('com.victronenergy.settings',
+-            '/Settings/SystemSetup/AcInput2') == 2 else 1
+-
+         if 'vebus' not in deltas:
+             return
+ 
+         vebus = deltas['vebus']
+-        vebus['/Energy/GridToAcOut'] = (
+-            (vebus['/Energy/AcIn1ToAcOut'] if acinput1_type == 1 else 0) +
+-            (vebus['/Energy/AcIn2ToAcOut'] if acinput2_type == 1 else 0))
+-        vebus['/Energy/GensetToAcOut'] = (
+-            (vebus['/Energy/AcIn1ToAcOut'] if acinput1_type == 2 else 0) +
+-            (vebus['/Energy/AcIn2ToAcOut'] if acinput2_type == 2 else 0))
+-        vebus['/Energy/GridToDc'] = (
+-            (vebus['/Energy/AcIn1ToInverter'] if acinput1_type == 1 else 0) +
+-            (vebus['/Energy/AcIn2ToInverter'] if acinput2_type == 1 else 0))
+-        vebus['/Energy/GensetToDc'] = (
+-            (vebus['/Energy/AcIn1ToInverter'] if acinput1_type == 2 else 0) +
+-            (vebus['/Energy/AcIn2ToInverter'] if acinput2_type == 2 else 0))
+-        vebus['/Energy/AcOutToGrid'] = (
+-            (vebus['/Energy/AcOutToAcIn1'] if acinput1_type == 1 else 0) +
+-            (vebus['/Energy/AcOutToAcIn2'] if acinput2_type == 1 else 0))
+-        vebus['/Energy/AcOutToGenset'] = (
+-            (vebus['/Energy/AcOutToAcIn1'] if acinput1_type == 2 else 0) +
+-            (vebus['/Energy/AcOutToAcIn2'] if acinput2_type == 2 else 0))
+-        vebus['/Energy/DcToGrid'] = (
+-            (vebus['/Energy/InverterToAcIn1'] if acinput1_type == 1 else 0) +
+-            (vebus['/Energy/InverterToAcIn2'] if acinput2_type == 1 else 0))
+-        vebus['/Energy/DcToGenset'] = (
+-            (vebus['/Energy/InverterToAcIn1'] if acinput1_type == 2 else 0) +
+-            (vebus['/Energy/InverterToAcIn2'] if acinput2_type == 2 else 0))
++        converted = {
++            '/Energy/GridToAcOut': 0,
++            '/Energy/GensetToAcOut': 0,
++            '/Energy/GridToDc': 0,
++            '/Energy/GensetToDc': 0,
++            '/Energy/AcOutToGrid': 0,
++            '/Energy/AcOutToGenset': 0,
++            '/Energy/DcToGrid': 0,
++            '/Energy/DcToGenset': 0,
++        }
++
++        # Classify each VE.Bus service before aggregation. Unless a per-device
++        # override is configured, the standard global AC input roles are used.
++        for service, values in rawdeltas.items():
++            if not service.startswith('com.victronenergy.vebus.'):
++                continue
++
++            instance = next((item[0] for item in values.values()), None)
++            if instance is None:
++                continue
++
++            def raw(path):
++                item = values.get(path)
++                return item[1] if item is not None else 0
++
++            for input_number in (1, 2):
++                role = self.get_vebus_input_type(instance, input_number)
++                suffix = str(input_number)
++
++                if role == 1:
++                    converted['/Energy/GridToAcOut'] += raw('/Energy/AcIn%sToAcOut' % suffix)
++                    converted['/Energy/GridToDc'] += raw('/Energy/AcIn%sToInverter' % suffix)
++                    converted['/Energy/AcOutToGrid'] += raw('/Energy/AcOutToAcIn%s' % suffix)
++                    converted['/Energy/DcToGrid'] += raw('/Energy/InverterToAcIn%s' % suffix)
++                else:
++                    converted['/Energy/GensetToAcOut'] += raw('/Energy/AcIn%sToAcOut' % suffix)
++                    converted['/Energy/GensetToDc'] += raw('/Energy/AcIn%sToInverter' % suffix)
++                    converted['/Energy/AcOutToGenset'] += raw('/Energy/AcOutToAcIn%s' % suffix)
++                    converted['/Energy/DcToGenset'] += raw('/Energy/InverterToAcIn%s' % suffix)
++
++        vebus.update(converted)
+ 
+         # Rename Inverter to Dc, so we are consistent with above
+         rename_dict_key(vebus, '/Energy/InverterToAcOut', '/Energy/DcToAcOut')

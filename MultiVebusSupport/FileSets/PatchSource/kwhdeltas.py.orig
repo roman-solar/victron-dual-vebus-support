@@ -1,0 +1,742 @@
+#!/usr/bin/python -u
+# -*- coding: utf-8 -*-
+
+"""
+GENERAL PRINCIPLES ON kWh deltas
+
+Requirements:
+For the 'Solar yield' and 'Consumption' tabs on the VRM Portal, we want to get the amount of energy
+generated and used. It needs to be split up in the following categories:
+- Energy from grid to consumers
+- Energy from grid to battery
+- Energy from genset to consumers
+- Energy from genset to battery
+- Energy from PV to consumers
+- Energy from PV to battery
+- Energy from PV to grid
+- Energy from Battery to consumers
+- Energy from Battery to grid
+
+When the hour passes, the amount of energy used cq. generated in that hour needs to be sent to the
+VRM Database. And during the actual hour, the amount of energy since the start of the hour is
+required, imagine looking at the graph and pressing F5 all the time: you will slowly see the bars
+growing during that hour.
+
+Input of this process:
+- The kWh counters (= energy) of all relevant devices (Multi, BMV, PV Inverters and Solar chargers).
+  Note that some of these do not store there counters in flash. So every time, for example, a Multi
+  starts up, it starts counting from 0.
+- And later, when adding DC consumption or hub-3, it is possibly also necessary also look at the
+  direction of DC or AC currents. See hfstore code.
+
+MEASUREMENT INACCURACIES
+Assume, for example, you have 3 counters, and since how they are connected electrically, they
+relate like a = b + c. But in reality, since all those measurements are not 100% accurate, this
+sum will never be 100%.
+
+In below calculations we face the same issue. The chosen approach is to prefer the counters that are
+also visible to the user elsewhere, for example to solar yield from the MPPT, or the kWh from the BMV.
+The counters in the Multi are not visible to the user.
+
+
+CALCULATION STATUS:
+This code calculates for dc-coupled and ac-coupled systems. It looks at AC consumption for consumption,
+DC consumption is computed when the DC-system is enabled in the settings (/Settings/SystemSetup/HasDcSystem).
+
+
+VEBUS DEVICES:
+The kWh values from ve.bus devices are based to AC power measurements. Multi's and Quatros measure AcIn
+power and inverter power (just before AC/DC conversion). AcOut power is computed from AcIn and AC inverter
+power. The power consumption of the ve.bus device itself is ignored.
+
+
+USAGE:
+vrmlogger makes an instance of this class. And calls getdeltas() everytime it sends data to the vrm-portal.
+Exactly on the hour, vrmlogger calls the same function, including a request to refresh the baseline.
+
+
+IMPLEMENTATION:
+This class, KwhDeltas, uses the DbusDeltas class to store the baselines and calculate the raw deltas. Those
+raw deltas are then converted into the required parameters by KwhDeltas.getdeltas(...)
+"""
+
+from dbus.mainloop.glib import DBusGMainLoop
+from dbus.exceptions import DBusException
+import argparse
+import logging
+import os
+import sys
+import time
+import pprint
+from datetime import datetime
+from collections import namedtuple
+from gi.repository import GLib
+
+# Victron imports
+sys.path.insert(1, os.path.join(os.path.dirname(__file__), './ext/velib_python'))
+from dbusmonitor import DbusMonitor
+from dbusdeltas import DbusDeltas
+from vedbus import VeDbusItemImport
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+BatteryService = namedtuple('BatteryService', ('service', 'instance'))
+
+def no_battery_service(reason):
+    logging.info("battery service not used #{}".format(reason))
+
+class KwhDeltas:
+    def __init__(self):
+        self._battery_service = None
+        self._store = {
+            'vebus': {
+                'services': set(), 'class': 'com.victronenergy.vebus',
+                'paths': [
+                    '/Energy/AcIn1ToInverter',
+                    '/Energy/AcIn2ToInverter',
+                    '/Energy/AcIn1ToAcOut',
+                    '/Energy/AcIn2ToAcOut',
+                    '/Energy/InverterToAcIn1',
+                    '/Energy/InverterToAcIn2',
+                    '/Energy/AcOutToAcIn1',
+                    '/Energy/AcOutToAcIn2',
+                    '/Energy/InverterToAcOut',
+                    '/Energy/OutToInverter']},
+            'pvac.genset': {
+                'services': set(), 'class': 'com.victronenergy.pvinverter',
+                'paths': [
+                    '/Ac/Energy/Forward']},
+            'pvac.output': {
+                'services': set(), 'class': 'com.victronenergy.pvinverter',
+                'paths': [
+                    '/Ac/Energy/Forward']},
+            'pvac.grid': {
+                'services': set(), 'class': 'com.victronenergy.pvinverter',
+                'paths': [
+                    '/Ac/Energy/Forward']},
+            'battery': {
+                'services': set(), 'class': 'com.victronenergy.battery',
+                'paths': [
+                    '/History/DischargedEnergy',
+                    '/History/ChargedEnergy']},
+            'solarcharger': {
+                'services': set(), 'class': 'com.victronenergy.solarcharger',
+                'paths': [
+                    '/Yield/User']},
+            'grid': {
+                'services': set(), 'class': 'com.victronenergy.grid',
+                'paths': [
+                    '/Ac/Energy/Forward',
+                    '/Ac/Energy/Reverse']},
+            'acload': {
+                'services': set(), 'class': 'com.victronenergy.acload',
+                'paths': [
+                    '/Ac/Energy/Forward']},
+            'heatpump': {
+                'services': set(), 'class': 'com.victronenergy.heatpump',
+                'paths': [
+                    '/Ac/Energy/Forward']},
+            'genset': {
+                'services': set(), 'class': 'com.victronenergy.genset',
+                'paths': [
+                    '/Ac/Energy/Forward']},
+            'dcmeter': {
+                'services': set(), 'class': 'com.victronenergy.dcmeter',
+                'paths': [
+                    '/Dc/0/Energy']},
+            'inverter': {
+                'services': set(), 'class': 'com.victronenergy.inverter',
+                'paths': [
+                    '/Energy/InverterToAcOut',
+                    '/Energy/OutToInverter',
+                    '/Energy/SolarToBattery',
+                    '/Energy/SolarToAcOut']},
+            'multi.grid': {
+                'services': set(), 'class': 'com.victronenergy.multi',
+                'paths': [
+                    '/Energy/AcIn1ToInverter',
+                    '/Energy/AcIn1ToAcOut',
+                    '/Energy/InverterToAcIn1',
+                    '/Energy/AcOutToAcIn1',
+                    '/Energy/InverterToAcOut',
+                    '/Energy/OutToInverter',
+                    '/Energy/SolarToAcOut',
+                    '/Energy/SolarToBattery',
+                    '/Energy/SolarToAcIn1']},
+            'multi.genset': {
+                'services': set(), 'class': 'com.victronenergy.multi',
+                'paths': [
+                    '/Energy/AcIn1ToInverter',
+                    '/Energy/AcIn1ToAcOut',
+                    '/Energy/InverterToAcIn1',
+                    '/Energy/AcOutToAcIn1',
+                    '/Energy/InverterToAcOut',
+                    '/Energy/OutToInverter',
+                    '/Energy/SolarToAcOut',
+                    '/Energy/SolarToBattery',
+                    '/Energy/SolarToAcIn1']},
+            'system': {
+                'services': set(), 'class': 'com.victronenergy.system',
+                'paths':[
+                    '/Timers/TimeOnInverter',
+                    '/Timers/TimeOnGrid',
+                    '/Timers/TimeOnGenerator',
+                    '/Timers/TimeOff']},
+            'generator': {
+                'services': set(), 'class': 'com.victronenergy.generator',
+                'paths': [
+                    '/AccumulatedRuntime']},
+            'evcharger': {
+                'services': set(), 'class': 'com.victronenergy.evcharger',
+                'paths': [
+                    '/Ac/Energy/Forward']},
+            'alternator': {
+                'services': set(), 'class': 'com.victronenergy.alternator',
+                'paths': [
+                    '/History/EnergyOut']},
+            'dcsource': {
+                'services': set(), 'class': 'com.victronenergy.dcsource',
+                'paths': [
+                    '/History/EnergyOut']}}
+
+        # note that these paths need to be present in self._store (see above) as well.
+        self._rawdeltas = {
+                'com.victronenergy.battery': {
+                    '/History/DischargedEnergy': 'dH21',
+                    '/History/ChargedEnergy': 'dH22'
+                },
+                'com.victronenergy.solarcharger': {
+                    '/Yield/User': 'dYU'
+                },
+                'com.victronenergy.pvinverter': {
+                    '/Ac/Energy/Forward': 'dpE'
+                },
+                'com.victronenergy.grid': {
+                    '/Ac/Energy/Forward': 'dgb',
+                    '/Ac/Energy/Reverse': 'dgs'
+                },
+                'com.victronenergy.acload': {
+                    '/Ac/Energy/Forward': 'daE',
+                },
+                'com.victronenergy.heatpump': {
+                    '/Ac/Energy/Forward': 'dhE',
+                },
+                'com.victronenergy.dcmeter': {
+                    '/Dc/0/Energy': 'ddE'
+                },
+                'com.victronenergy.evcharger': {
+                    '/Ac/Energy/Forward': 'evE'
+                }
+        }
+
+        # Items we watch, but we don't calculate deltas for them
+        self._non_store = {
+            'com.victronenergy.pvinverter': ['/Position'],
+            'com.victronenergy.multi': ['/Ac/In/1/Type', '/Ac/In/2/Type'],
+            'com.victronenergy.dcsource': ['/Settings/MonitorMode', ],
+        }
+
+    def start(self, dbusmonitor, ve_item_gen = None):
+        self._dbusmonitor = dbusmonitor
+        self._ve_item_gen = ve_item_gen
+
+        logger.debug(
+            "KwhDeltas.start(): starting up, with self._store: \n%s\n" % pprint.pformat(self._store))
+
+        self._dbusdeltas = DbusDeltas(self._dbusmonitor, self._store)
+
+        # init all instances already existing on the dbus
+        services = self._dbusmonitor.get_service_list()
+        for name, instance in services.items():
+            self.handle_new_service(name, instance)
+
+        self._setup_active_battery_monitor()
+
+    def get_dbusmonitortree(self):
+        # Get all unique serviceclasses from self._store, and all paths.
+        dbusmonitoritems = {}
+        # dummy data since DbusMonitor wants it:
+        dummy = {'code': None, 'whenToLog': None, 'accessLevel': None}
+        for d in self._store.values():
+            if d['class'] not in dbusmonitoritems:
+                dbusmonitoritems[d['class']] = {}
+
+            for path in d['paths']:
+                dbusmonitoritems[d['class']][path] = dummy
+
+        for k, li in self._non_store.items():
+            if k not in dbusmonitoritems:
+                dbusmonitoritems[k] = {}
+            for p in li:
+                dbusmonitoritems[k][p] = dummy
+
+        return dbusmonitoritems
+
+    def handle_new_service(self, servicename, instance):
+        logger.debug("handle_new_service: %s" % servicename)
+
+        serviceclass = servicename.split('.')
+        if len(serviceclass) < 3 or serviceclass[1] != 'victronenergy':
+            return
+
+        serviceclass = serviceclass[2]
+
+        if serviceclass == 'pvinverter':
+            self._add_pvinverter_service(servicename, instance)
+
+        elif serviceclass == 'battery':
+            # Battery services handling is based on the active battery service
+            # provided by systemcalc, which also changes when active battery
+            # service disappears from the D-Bus. There is however a race
+            # condition where vrmlogger sees the new battery after
+            # systemcalc, causing the battery to be ignored. To ensure that
+            # the battery is always added, add the battery (again) if it matches
+            # the service name specified by systemcalc.
+            if self._battery_service  is not None and self._battery_service.service == servicename:
+                self._add_battery_service(servicename, instance)
+
+        elif serviceclass == 'system':
+            # If systemcalc is somehow restarted we need to reconnect to the /ActiveBatteryService item.
+            self._dbusdeltas.add_service(servicename, instance, 'system')
+            self._setup_active_battery_monitor()
+
+        elif serviceclass == 'multi':
+            self._add_multirs_service(servicename, instance)
+
+        elif serviceclass == 'dcsource':
+            self._add_dcsource_service(servicename, instance)
+
+        elif serviceclass in ('vebus', 'solarcharger', 'grid', 'genset',
+                'dcmeter', 'inverter', 'generator', 'evcharger', 'acload',
+                'heatpump', 'alternator'):
+            self._dbusdeltas.add_service(servicename, instance, serviceclass)
+
+    def handle_removed_service(self, servicename, instance):
+        self._dbusdeltas.remove_service(servicename)
+
+
+    def handle_acinput_config_changed(self):
+        services = set(self._dbusdeltas.get_all_services('pvac.grid') + \
+            self._dbusdeltas.get_all_services('pvac.genset') + \
+            self._dbusdeltas.get_all_services('pvac.output'))
+
+        # Clear deltas conforming to the old config
+        self._dbusdeltas.remove_all_services('pvac.grid')
+        self._dbusdeltas.remove_all_services('pvac.genset')
+        self._dbusdeltas.remove_all_services('pvac.output')
+
+        # Add pv-inverters back, using new config
+        for service, instance in services:
+            self._add_pvinverter_service(service, instance)
+
+    # Core of this class. Performs calculations and returns all kwhdeltas in a dict which is formatted to
+    # be sent straight to VRM.
+    def getdeltas(self, refreshbaseline):
+
+        # Make sure the ActiveBatteryService is added to dbusdeltas. Due to
+        # the posibility of race conditions in the availability of energy
+        # data during startup/boot, the service may have been skipped at
+        # that time. If the ActiveBatteryService is not added to dbusdeltas,
+        # then try again.
+        if self._battery_service is not None and not self._dbusdeltas.has_service(self._battery_service.service):
+            self._add_battery_service(self._battery_service.service, self._battery_service.instance, no=(lambda s: None))
+
+        baselinetimestamp, deltas, rawdeltas, servicecounts = self._dbusdeltas.get_deltas(refreshbaseline)
+
+        grid_in = deltas['grid']['/Ac/Energy/Forward']
+        grid_out = deltas['grid']['/Ac/Energy/Reverse']
+        genset_in = deltas['genset']['/Ac/Energy/Forward']
+        pvac_grid = deltas['pvac.grid']['/Ac/Energy/Forward']
+        pvac_genset = deltas['pvac.genset']['/Ac/Energy/Forward']
+        pvac_out = deltas['pvac.output']['/Ac/Energy/Forward']
+        pvdc = deltas['solarcharger']['/Yield/User']
+        altdc = deltas['dcsource']['/History/EnergyOut'] + deltas['alternator']['/History/EnergyOut']
+        vebus = deltas['vebus']
+        inverter = deltas['inverter']
+        multi_grid = deltas['multi.grid'] # Values for Multi-RS
+        multi_genset = deltas['multi.genset']
+
+        acgrid_to_dc = vebus['/Energy/GridToDc'] + multi_grid['/Energy/AcIn1ToInverter']
+        acgrid_to_acout = vebus['/Energy/GridToAcOut'] + multi_grid['/Energy/AcIn1ToAcOut']
+        acgenset_to_dc = vebus['/Energy/GensetToDc'] + multi_genset['/Energy/AcIn1ToInverter']
+        acgenset_to_acout = vebus['/Energy/GensetToAcOut'] + multi_genset['/Energy/AcIn1ToAcOut']
+        acout_to_dc = vebus['/Energy/AcOutToDc'] + \
+            inverter['/Energy/OutToInverter'] + \
+            multi_grid['/Energy/OutToInverter'] + \
+            multi_genset['/Energy/OutToInverter']
+        acout_to_acgrid = vebus['/Energy/AcOutToGrid'] + multi_grid['/Energy/AcOutToAcIn1']
+        acout_to_acgenset = vebus['/Energy/AcOutToGenset'] + multi_genset['/Energy/AcOutToAcIn1']
+        dc_to_acgrid = vebus['/Energy/DcToGrid'] + multi_grid['/Energy/InverterToAcIn1']
+        dc_to_acout = vebus['/Energy/DcToAcOut'] + \
+            inverter['/Energy/InverterToAcOut'] + \
+            multi_grid['/Energy/InverterToAcOut'] + \
+            multi_genset['/Energy/InverterToAcOut']
+
+        grid_to_consumption = 0
+        pv_to_consumption = inverter['/Energy/SolarToAcOut'] + \
+            multi_grid['/Energy/SolarToAcOut'] + \
+            multi_genset['/Energy/SolarToAcOut']
+        bat_to_consumption = 0
+        genset_to_consumption = 0
+        pv_to_bat = inverter['/Energy/SolarToBattery'] + \
+            multi_grid['/Energy/SolarToBattery'] + \
+            multi_genset['/Energy/SolarToBattery']
+        pv_to_grid = 0
+
+        has_dc_system = self._dbusmonitor.get_value('com.victronenergy.settings',
+                                                    '/Settings/SystemSetup/HasDcSystem')
+
+        # Due to a bug in the BMV 70x firmware (v3.07 and earlier), the ChargedEnergy and DischargedEnergy
+        # are not reliable, so we use these values only when we really need them: if a DC system is present.
+        # In that case we need the Charged/Discharged energy to compute the DC consumption.
+        # You can find the old algorithm in vrmlogger v2.42. This version would scale the vebus kWh values
+        # using the battery kWh values.
+        if servicecounts['battery']['/History/DischargedEnergy'] > 0 and has_dc_system:
+            bat_in = deltas['battery']['/History/DischargedEnergy']
+            bat_out = deltas['battery']['/History/ChargedEnergy']
+            pvdc, bat_out, pvdc_to_bat = _distribute(pvdc, bat_out)
+            altdc, bat_out, alt_to_bat = _distribute(altdc, bat_out)
+        else:
+            # We have to take the charge sources, PV and alternators, and
+            # subtract in steps energy consumed, taking first from PV, then
+            # from the alternator. What remains of either becomes pv_to_bat
+            # and alt_to_bat. pvdc and altdc holds the remainder, which
+            # is probably consumption.
+            dc_to_ac = dc_to_acgrid + dc_to_acout
+            pvdc_to_bat = max(0, pvdc - dc_to_ac)
+
+            # Alternator to bat is energy from alternator, minus the loads
+            # not covered by DCPV.
+            alt_to_bat = max(0, altdc - max(0, dc_to_ac - pvdc))
+
+            bat_in = max(0, dc_to_ac - pvdc - altdc)
+            bat_out = acgrid_to_dc + acgenset_to_dc + acout_to_dc
+            pvdc -= pvdc_to_bat
+            altdc -= alt_to_bat
+
+        if servicecounts['grid']['/Ac/Energy/Forward'] == 0:
+            grid_in = max(0, acgrid_to_dc + acgrid_to_acout - pvac_grid)
+            grid_out = dc_to_acgrid + acout_to_acgrid  + multi_grid['/Energy/SolarToAcIn1']
+
+        if servicecounts['genset']['/Ac/Energy/Forward'] == 0:
+            genset_in = max(0, acgenset_to_dc + acgenset_to_acout - pvac_genset)
+
+        # This is how the code below works: we take a measured kWh value (eg. pvac_grid) and distribute it
+        # over a list of possible destinations (in case below acgrid_to_dc, grid_out, ac_grid_to_acout).
+        # The destinations are sorted by priority. So if acgrid_to_dc > pvac_grid, it is assumes that all
+        # energy from pvac_grid has flown to acgrid_to_dc, and there is nothing left for the others (in case
+        # below grid_out and ac_grid_to_acout).
+        # The distributed values are stored in pvac_in_to_dc, pvac_in_to_grid, pvac_in_to_acout. The energy
+        # in pvac_in_to_dc will be distributed later to construct PV to battery and PV to (DC) consumption.
+        # What is left of pvac_grid in the end is assumed to be part of the consumption.
+        pvac_grid, acgrid_to_dc, pvac_in_to_dc = _distribute(pvac_grid, acgrid_to_dc)
+        pvac_grid, grid_out, pvac_in_to_grid = _distribute(pvac_grid, grid_out)
+        pvac_grid, acgrid_to_acout, pvac_in_to_acout = _distribute(pvac_grid, acgrid_to_acout)
+
+        # Addition January 2022: The MultiRS has PV that ties onto the AC bus,
+        # like a PV-inverter, but it has separate energy counters for energy
+        # going to Ac-Out or the battery. Hence we bring in PV from the
+        # Multi-RS only after distributing pvac_grid to AC-Out and the battery.
+        # If there is any of grid_out left, we assume this comes from the
+        # Multi-RS. What remains must be part of consumption then.
+        pv_multirs_grid = multi_grid['/Energy/SolarToAcIn1']
+        pv_multirs_grid, grid_out, pv_multirs_in_to_grid = _distribute(pv_multirs_grid, grid_out)
+
+        # Now we can estimate how much of the PV went to consumption, and what
+        # ended up in the grid
+        pv_to_consumption += pvac_grid + pvac_in_to_acout + pv_multirs_grid
+        pv_to_grid += pvac_in_to_grid + pv_multirs_in_to_grid
+
+        # Now we distribute grid_in (energy taken from grid). Energy from grid is usually fed to the inverter
+        # (AC_In), but may also be consumed directly (Hub-4). The inverter knows which part is sent to AC_Out
+        # or the DC out.
+        grid_in, acgrid_to_dc, grid_to_dc = _distribute(grid_in, acgrid_to_dc)
+        grid_in, acgrid_to_acout, grid_to_acout = _distribute(grid_in, acgrid_to_acout)
+        grid_to_consumption += grid_in + grid_to_acout
+
+        pvac_genset, acgenset_to_dc, pvac_genset_to_dc = _distribute(pvac_genset, acgenset_to_dc)
+        pvac_genset, acgenset_to_acout, pvac_genset_to_acout = _distribute(pvac_genset, acgenset_to_acout)
+        pv_to_consumption += pvac_genset + pvac_genset_to_acout
+
+        genset_in, acgenset_to_dc, genset_to_dc = _distribute(genset_in, acgenset_to_dc)
+        genset_in, acgenset_to_acout, genset_to_acout = _distribute(genset_in, acgenset_to_acout)
+        genset_to_consumption += genset_in + genset_to_acout
+
+        pvac_out, acout_to_dc, pvac_out_to_dc = _distribute(pvac_out, acout_to_dc)
+        pvac_out, acout_to_acgrid, pvac_out_to_acgrid = _distribute(pvac_out, acout_to_acgrid)
+        pvac_out, acout_to_acgenset, pvac_out_to_acgenset = _distribute(pvac_out, acout_to_acgenset)
+        pv_to_consumption += pvac_out + pvac_out_to_acgenset
+
+        grid_to_dc, bat_out, grid_to_bat = _distribute(grid_to_dc, bat_out)
+        grid_to_consumption += grid_to_dc
+
+        genset_to_dc, bat_out, genset_to_bat = _distribute(genset_to_dc, bat_out)
+        genset_to_consumption += genset_to_dc
+
+        pvac_in_to_dc, bat_out, pvac_in_to_bat = _distribute(pvac_in_to_dc, bat_out)
+        pv_to_consumption += pvac_in_to_dc
+        pv_to_bat += pvac_in_to_bat
+
+        pvac_genset_to_dc, bat_out, pvac_genset_to_bat = _distribute(pvac_genset_to_dc, bat_out)
+        pv_to_consumption += pvac_genset_to_dc
+        pv_to_bat += pvac_genset_to_bat
+
+        pvac_out_to_dc, bat_out, pvac_out_to_bat = _distribute(pvac_out_to_dc, bat_out)
+        pv_to_consumption += pvac_out_to_dc
+        pv_to_bat += pvac_out_to_bat
+
+        bat_in, dc_to_acout, bat_to_acout = _distribute(bat_in, dc_to_acout)
+        bat_in, dc_to_acgrid, bat_to_acin = _distribute(bat_in, dc_to_acgrid)
+        bat_to_consumption += bat_to_acout
+        if has_dc_system:
+            bat_to_consumption += bat_in
+
+        # Whatever PV was not used by the battery above, allocate to the
+        # AC usage buckets
+        pvdc, dc_to_acout, pvdc_to_acout = _distribute(pvdc, dc_to_acout)
+        pvdc, dc_to_acgrid, pvdc_to_acin = _distribute(pvdc, dc_to_acgrid)
+
+        # Whatever alternator energy did not go to the battery above,
+        # allocate to the AC side. Alternator energy is not sent back to
+        # the grid, so we assume all of it is consumption.
+        altdc, dc_to_acout, altdc_to_acout = _distribute(altdc, dc_to_acout)
+        altdc, dc_to_acgrid, altdc_to_acin = _distribute(altdc, dc_to_acgrid)
+
+        pv_to_consumption += pvdc_to_acout
+        genset_to_consumption += altdc_to_acout + altdc_to_acin
+        # If there is dc energy left, those must have been used by a DC
+        # consumer.
+        if has_dc_system:
+            pv_to_consumption += pvdc
+            genset_to_consumption += altdc
+        pv_to_bat += pvdc_to_bat
+        genset_to_bat += alt_to_bat
+
+        pvdc_to_acin, grid_out, pvdc_to_grid = _distribute(pvdc_to_acin, grid_out)
+        pv_to_grid += pvdc_to_grid
+        pv_to_consumption += pvdc_to_acin
+
+        pvac_out_to_acgrid, grid_out, pvac_out_to_grid = _distribute(pvac_out_to_acgrid, grid_out)
+        pv_to_consumption += pvac_out_to_acgrid
+        pv_to_grid += pvac_out_to_grid
+
+        bat_to_acin, grid_out, bat_to_grid = _distribute(bat_to_acin, grid_out)
+        bat_to_consumption += bat_to_acin
+
+        result = {}
+        result['Gc'] = grid_to_consumption
+        result['Gb'] = grid_to_bat
+        result['gc'] = genset_to_consumption
+        result['gb'] = genset_to_bat
+        result['Pb'] = pv_to_bat
+        result['Pc'] = pv_to_consumption
+        result['Pg'] = pv_to_grid
+        result['Bc'] = bat_to_consumption
+        result['Bg'] = bat_to_grid
+
+        # Timers
+        system = deltas['system']
+        result['To'] = system['/Timers/TimeOff']
+        result['Tgs'] = system['/Timers/TimeOnGenerator']
+        result['Tg'] = system['/Timers/TimeOnGrid']
+        result['Ti'] = system['/Timers/TimeOnInverter']
+
+        # Generator run time
+        result['Tga'] = deltas['generator']['/AccumulatedRuntime']
+
+        for servicename, details in rawdeltas.items():
+            for path, tuple in details.items():
+                serviceclass = '.'.join(servicename.split('.')[0:3])
+
+                code = self._rawdeltas.get(serviceclass, {}).get(path)
+                logger.debug("service: %s, path: %s, code: %s" %  (servicename, path, code))
+                if code:
+                    result[code + "[" + str(tuple[0]) + "]"] = tuple[1]
+
+        # The timestamp sent with the kWh data is specified in minutes, but rounded to 15 minutes.
+        # Note that we use UTC timestamps here, because the old hourly kwhDeltas did so as well.
+        # The old implementation used time.gmtime.
+        date = datetime.utcfromtimestamp(baselinetimestamp)
+        date = date.replace(minute = date.minute - date.minute % 15, second=0, microsecond=0)
+        result['Et'] = date.strftime("%Y%m%d%H%M")
+
+        logger.debug("Calculated deltas, with baseline-timestamp: %s, age (m): %s" % (
+            baselinetimestamp,
+            (time.time() - baselinetimestamp) / 60))
+
+        return result
+
+    def _get_import_item(self, service_name, path, eventCallback=None):
+        if self._ve_item_gen is None:
+            return VeDbusItemImport(self._dbusmonitor.dbusConn, service_name, path, eventCallback)
+        else:
+            return self._ve_item_gen(service_name, path, eventCallback)
+
+    def _setup_active_battery_monitor(self):
+        """ This is called at startup, and when systemcalc comes up. """
+        try:
+            self._active_battery_item = self._get_import_item('com.victronenergy.system',
+                                                          '/ActiveBatteryService',
+                                                          lambda x,y,z: self._update_active_battery_service())
+        except DBusException:
+            self._dbusdeltas.remove_all_services('battery')
+        else:
+            self._update_active_battery_service()
+
+    def _update_active_battery_service(self):
+        battery_service = self._active_battery_item.get_value()
+        self._dbusdeltas.remove_all_services('battery')
+        self._battery_service = None
+
+        if battery_service is None:
+            no_battery_service(1); return
+
+        instance = battery_service.split('/')[1]
+        battery_service = battery_service.replace('.', '_').replace('/', '_')
+        service_mapping = self._get_import_item('com.victronenergy.system',
+                                                '/ServiceMapping/' + battery_service)
+        battery_service = service_mapping.get_value()
+        if battery_service is None:
+            no_battery_service(2); return
+
+        # Selected battery service may also be a vebus device, which should not be added as a battery
+        spl = battery_service.split('.')
+        if len(spl) < 3 or spl[2] != 'battery':
+            no_battery_service(3); return
+
+        # Store the battery service to work around a race condition. If the
+        # battery shows up later than systemcalc, we can use this information
+        # to call _add_battery_service later.
+        self._battery_service = BatteryService(battery_service, instance)
+        self._add_battery_service(battery_service, instance)
+
+    def _add_battery_service(self, battery_service, instance, no=no_battery_service):
+        # Avoid adding it twice
+        if self._dbusdeltas.has_service(battery_service):
+            no(9); return
+
+        # Skip battery services that don't have the counters we need. This will also filter out the
+        # BMV-60x series
+        if self._dbusmonitor.get_value(battery_service, '/History/DischargedEnergy') is None:
+            no(4); return
+        if self._dbusmonitor.get_value(battery_service, '/History/ChargedEnergy') is None:
+            no(5); return
+
+        # Filter out all battery monitors with bugs in their kwh counter implementation
+        fw_version = self._dbusmonitor.get_value(battery_service, '/FirmwareVersion')
+        product_id = self._dbusmonitor.get_value(battery_service, '/ProductId')
+        if product_id in (0x0203, 0x0204, 0x0205) and fw_version < 0x0308:
+            logging.info("ignoring bmv-70x with fw_version %x" % (fw_version if fw_version else 0))
+            no(6); return
+
+        if product_id == 0x0141 and fw_version < 0x0110:
+            logging.info("ignoring Lynx Shunt VE.Can with fw_version %x" % (fw_version if fw_version else 0))
+            no(7); return
+
+        if product_id == 0xA130 and fw_version < 0x0131:
+            logging.info("ignoring Lynx Ion + Shunt with fw_version %x" % (fw_version if fw_version else 0))
+            no(8); return
+
+        # The other used productids are:
+        # 0xB000 = Valence XP
+        # 0xB00* = Redflow ZBM, etc. etc.
+
+        logger.info('active battery service: %s' % battery_service)
+        self._dbusdeltas.add_service(battery_service, instance, 'battery')
+
+    def _add_pvinverter_service(self, servicename, instance):
+        # Split pv inverters in three groups: grid, genset and mains
+        # First get the position, then lookup the AC input type to
+        # find out what that means.
+        position = self._dbusmonitor.get_value(servicename, '/Position')
+
+        if position == 1:
+            pvtype = 'pvac.output'
+        else:
+            if self._dbusmonitor.get_value('com.victronenergy.settings',
+                    '/Settings/SystemSetup/AcInput{}'.format(
+                    2 if position == 2 else 1)) == 2:
+                pvtype = 'pvac.genset'
+            else:
+                pvtype = 'pvac.grid'
+
+        logger.debug("%s, p:%s = %s" % (servicename, position, pvtype))
+        self._dbusdeltas.add_service(servicename, instance, pvtype)
+
+    def _add_multirs_service(self, servicename, instance, count=5):
+        # FIXME: Only one input supported for now! No support for a future Quattro-RS yet
+        source = self._dbusmonitor.get_value(servicename, '/Ac/In/1/Type')
+
+        # If the source is not known yet, try again later.
+        if source is None and count > 0:
+            GLib.timeout_add(1000, self._add_multirs_service, servicename, instance, count-1)
+            return False
+
+        self._dbusdeltas.add_service(servicename, instance,
+            'multi.genset' if source == 2 else 'multi.grid')
+
+        return False
+
+    def _add_dcsource_service(self, servicename, instance):
+        if self._dbusmonitor.get_value(servicename, '/Settings/MonitorMode') == -1:
+            self._dbusdeltas.add_service(servicename, instance, 'dcsource')
+
+def _distribute(src, dest):
+    v = min(src, dest)
+    src -= v
+    dest -= v
+    return src, dest, v
+
+
+# === All code below is to debug this class without needing to run the the full vrmlogger ===
+kwhdeltas = None
+
+def handle_timer():
+    from pprint import pprint
+    try:
+        deltas = kwhdeltas.getdeltas(refreshbaseline=False)
+        pprint(deltas)
+        return True
+    except:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+# Called from the dbusmonitor
+def handle_new_service(servicename, deviceinstance):
+    kwhdeltas.handle_new_service(servicename, deviceinstance)
+
+
+# Called from the dbusmonitor
+def handle_removed_service(servicename, deviceinstance):
+    kwhdeltas.handle_removed_service(servicename, deviceinstance)
+
+
+def main():
+    global kwhdeltas
+
+    logging.basicConfig(level=logging.DEBUG)
+
+    # Have a mainloop, so we can send/receive asynchronous calls to and from dbus
+    DBusGMainLoop(set_as_default=True)
+
+    kwhdeltas = KwhDeltas()
+    kwhdeltas.start(
+        DbusMonitor(
+            dbusTree=kwhdeltas.get_dbusmonitortree(),
+            deviceAddedCallback=handle_new_service,
+            deviceRemovedCallback=handle_removed_service)
+    )
+
+    GLib.timeout_add(3000, handle_timer)
+
+    # Start and run the mainloop
+    logging.info("Starting mainloop, responding on only events from now on. Press ctrl-Z to see the deltas")
+    mainloop = GLib.MainLoop()
+    mainloop.run()
+
+
+if __name__ == "__main__":
+    main()
