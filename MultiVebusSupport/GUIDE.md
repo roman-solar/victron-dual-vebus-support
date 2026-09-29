@@ -1,6 +1,6 @@
 # Dual VE.Bus Support for Victron Venus OS
 
-Field-test SetupHelper package for Venus OS installations with two independent VE.Bus systems sharing one DC bus.
+Field-tested on the documented installation with two independent VE.Bus systems sharing one DC bus; adaptation and testing are required for other installations.
 
 The product name is **Dual VE.Bus Support for Victron Venus OS**. Its installation identifier remains `MultiVebusSupport`, which is used by SetupHelper and in the GX directory and configuration paths below.
 
@@ -8,7 +8,7 @@ The product name is **Dual VE.Bus Support for Victron Venus OS**. Its installati
 
 ## External dependency
 
-[SetupHelper](https://github.com/kwindrem/SetupHelper) by Kevin Windrem must be installed separately on the GX device. This package calls its installation, removal and firmware-update reinstallation helpers; SetupHelper itself is not bundled. The documented field test used SetupHelper 9.4.
+[SetupHelper](https://github.com/kwindrem/SetupHelper) by Kevin Windrem must be installed separately on the GX device. This package calls its installation, removal and firmware-update reinstallation helpers; SetupHelper itself is not bundled. Version `9.4` was tested. Other SetupHelper versions have not been validated for this package.
 
 Field-tested development base:
 - Venus OS v3.79
@@ -48,7 +48,7 @@ A `com.victronenergy.acload` meter may replace live `/Ac/Consumption/*` only whe
 > [!IMPORTANT]
 > Do **not** enable this for a branch meter that measures only one load or circuit, for example a heat pump, EV charger or sub-panel. In that case the standard SystemCalc calculation must remain authoritative.
 
-If the configured meter disappears, or a phase value is unavailable, SystemCalc falls back to its normal calculation.
+Fallback is per value: available meter Power and Current readings replace the corresponding phase values; unavailable values retain the normal calculation. If the meter disappears or is disconnected, all values use the normal calculation. Partial data can therefore produce a mixture of meter readings and calculated values.
 
 This setting affects live SystemCalc consumption only. It does not force historical VRM `Total Consumption` to equal the external AC Load meter energy. The difference may legitimately appear as `Base Load` because energy can be consumed inside the conversion chain (AC-to-DC charger, DC-to-AC inverter, device self-consumption) or arise from normal measurement differences. Preserving that difference keeps the overall Victron energy balance intact.
 
@@ -68,7 +68,7 @@ Persistent runtime configuration is stored outside the package at:
 
 It survives package replacement and Venus OS firmware updates.
 
-The package default is deliberately fail-safe for portability: optional features are disabled and no per-device input overrides are defined. A new installation must be configured for its actual topology before optional fixes are enabled.
+The default has optional features disabled and no per-device input overrides. Fix 1 applies when the package is installed; Fix 2 requires an input-role override; Fixes 3 and 4 require their respective switches. Configure the actual topology before enabling optional fixes.
 
 Example for a system with charger DeviceInstance `100` and a full-load meter with DeviceInstance `0`:
 
@@ -91,7 +91,29 @@ Example for a system with charger DeviceInstance `100` and a full-load meter wit
 
 `ac_load_authoritative.enabled` and `cross_vebus_passthrough.enabled` are diagnostic A/B switches. The configuration is read at process startup.
 
-Use the package helper instead of external Node-RED/state-file controls:
+### Find and verify the device instances
+
+From the GX SSH console, run `dbus-spy`, Victron's [D-Bus inspection tool](https://github.com/victronenergy/dbus-spy). Inspect the intended `com.victronenergy.vebus.*` charger and `com.victronenergy.acload.*` meter. Read each service's `/DeviceInstance`, `/ProductName`, `/CustomName` where present, and `/Connected`; compare its live readings with the physical device and wiring. For the meter, verify that all AC loads, including bypass paths, pass through its measurement boundary.
+
+Use the D-Bus `/DeviceInstance` value, not a number inferred from the service name or USB port. The numbers `100` and `0` above are examples. Do not change a device's instance just to match this example.
+
+### Edit and apply the configuration
+
+1. Back up `/data/setupOptions/MultiVebusSupport/config.json` outside the package directory.
+2. Edit the JSON for the verified instances and physical input roles. Keep the two feature sections as objects containing boolean `enabled` values; do not replace them with `null`, lists or scalar values.
+3. Check JSON syntax with `python3 -m json.tool /data/setupOptions/MultiVebusSupport/config.json`. This checks syntax only; manually verify the schema and topology described above.
+4. Apply a manual meter-instance change by restarting SystemCalc; apply manual input-role or cross-VE.Bus changes by restarting vrmlogger. If both sets of settings changed, restart both:
+
+```bash
+svc -t /service/dbus-systemcalc-py
+svc -t /service/vrmlogger
+sleep 5
+svstat /service/dbus-systemcalc-py /service/vrmlogger
+```
+
+5. Run `tools/feature.sh status` and check the services again after a further short interval. A changed PID alone does not establish healthy operation. Confirm D-Bus readings and the flows using the verification steps below. The status helper displays the configuration on disk; it does not prove that a running process loaded it.
+
+For changing only an enabled switch, the package helper edits the persistent JSON atomically and restarts the corresponding service:
 
 ```bash
 /data/MultiVebusSupport/tools/feature.sh status
@@ -101,9 +123,49 @@ Use the package helper instead of external Node-RED/state-file controls:
 /data/MultiVebusSupport/tools/feature.sh cross-vebus off
 ```
 
-The helper edits the persistent JSON atomically and restarts only the service that reads the changed option.
+Changing a meter instance or input-role override still requires the manual application steps above.
 
-Legacy development controls that write `/data/custom-systemcalc/acload-authoritative.state` are not connected to this package and should be removed after migration so they cannot display a misleading state.
+## Verification after installation
+
+Run `/data/MultiVebusSupport/tools/status.sh`. Confirm the installed version, saved configuration, service operation and live readings. In safe operating conditions already permitted by the installation, compare charger OFF, charger power above load, and charger power below load. Compare consumption with the complete-load meter when present, and compare battery power with the physical charge/discharge state.
+
+For an authoritative load meter, disabling `ac-load` should restore the calculated live consumption; enabling it should use the meter's available phase values. Test meter-loss fallback only when it can be done without disrupting the installation. Do not disconnect the BMS or change power wiring for this check.
+
+Compare historical attribution over a new, settled VRM interval for each mode. `Total Consumption` can include conversion losses and device self-consumption; it need not equal the external AC meter. Record the package commit, configuration and test times. The known limitations below remain relevant even when these checks pass.
+
+## Updating the package
+
+Updates from GitHub are installed manually. SetupHelper's firmware-update recovery uses the package already stored under `/data`; it does not download each new GitHub publication.
+
+Save the existing package directory and runtime configuration before replacement. Review the new release's compatibility and migration notes, copy its `MultiVebusSupport/` contents to `/data/MultiVebusSupport`, and run:
+
+```bash
+/data/MultiVebusSupport/setup install
+```
+
+Keep `/data/setupOptions/MultiVebusSupport/config.json` outside the replacement directory. Recheck configuration, services and energy flows afterwards. Use explicit `setup install` for a deliberate reinstall of the same runtime version; the boot-time `reinstall` mode can skip an already installed matching version.
+
+## Uninstall and recovery
+
+Back up the package and configuration, then remove the patches through SetupHelper:
+
+```bash
+/data/MultiVebusSupport/setup uninstall
+```
+
+Check `tools/status.sh`, service operation and the return to the normal energy calculation. With SetupHelper 9.4, uninstall removes the installed-version marker and sets `DO_NOT_AUTO_INSTALL`; the options directory and configuration are retained. Confirm this on the target before removing any backup. Disabling the two optional switches leaves Fix 1 and configured input-role overrides in place and does not uninstall the package.
+
+Deleting `/data/MultiVebusSupport` alone does not remove the installed patches. To reinstall, restore the reviewed package directory, run `setup install`, apply the saved configuration and repeat verification. To roll back a version, uninstall the current package and install the saved previous package with its compatible configuration.
+
+If normal access or removal is unavailable, use the external [SetupHelper recovery instructions](https://github.com/kwindrem/SetupHelper#system-recovery). Actual uninstall, reinstall and recovery remain part of the planned field tests.
+
+## Known limitations of v0.9b4
+
+- A syntactically valid JSON file with a non-object `cross_vebus_passthrough` section can prevent vrmlogger startup. Keep the documented structure; if startup fails after an edit, restore the saved valid configuration and restart vrmlogger.
+- With cross-VE.Bus correction enabled, a temporarily missing energy counter can cause older Grid energy to be matched with later battery-fed loads. The correction has not passed continuity tests for interrupted readings; disabling `cross-vebus` restores the standard historical attribution, including its original limitations for this topology.
+- When another modification changes the same upstream files, the preflight's stock `.orig` input can differ from SetupHelper's actual installer input. v0.9b4 does not establish strict compatibility for such combinations; resolve overlapping modifications before installation.
+
+These issues were reproduced in isolated code tests. Fixes are planned for a later field-tested version; they are not included in v0.9b4.
 
 ## Tested on the development system
 
@@ -147,12 +209,12 @@ Before installation/reinstallation, `tools/preflight.sh` performs the following 
 7. reverse the same patch with zero fuzz;
 8. require the reverse result to reproduce the upstream source byte-for-byte.
 
-SetupHelper then performs its own forward/reverse patch checks before modifying the system.
+SetupHelper performs its own forward/reverse checks while preparing installer candidates. In v0.9b4 the package's zero-fuzz check covers the selected stock source; it does not verify every possible combined candidate containing other modifications. See the known limitations above.
 
-If any compatibility check fails, installation/reinstallation stops before the package intentionally modifies the upstream files. The new Venus OS therefore remains on stock behavior until the patch is reviewed and adapted.
+If a compatibility check fails, installation/reinstallation reports failure and SetupHelper handles cleanup. After a firmware update, confirm the resulting files and service operation on the device before relying on the calculation. The complete firmware-update path has not been field-tested.
 
 > [!NOTE]
-> Passing structural compatibility on a future Venus version means only that the patch still applies safely. It does **not** make that Venus version field-validated. PV, Generator and other regression tests should be repeated before adding the new stock hashes to `validated-sources.tsv`.
+> Passing structural compatibility confirms the checked source can be patched and restored. It does **not** make that Venus version field-validated. PV, Generator and other regression tests should be repeated before adding the new stock hashes to `validated-sources.tsv`.
 
 ### Validated source list
 
@@ -172,7 +234,7 @@ The package uses the following safety measures:
 - Python compile checks before installation;
 - persistent configuration outside the package directory;
 - SetupHelper rollback/uninstall information;
-- explicit `vrmlogger` restart verification so the new Python code is active before installation is reported complete.
+- observation of a changed `vrmlogger` PID after restart; check continued process operation and readings separately.
 
 ## VRM UI observation
 
@@ -211,8 +273,6 @@ Feature A/B switches:
 ```bash
 /data/MultiVebusSupport/tools/feature.sh status
 ```
-
-The old development directories `/data/custom-systemcalc` and `/data/custom-vrmlogger` are not used by this package. Keep them only as an archived development record until the package has completed field testing, then move the history to Git and remove the live legacy directories from the GX device.
 
 ## License
 
