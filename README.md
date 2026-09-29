@@ -1,6 +1,6 @@
 # Dual VE.Bus Support for Victron Venus OS
 
-Patches correcting real-time energy flows and historical energy statistics in Victron Venus OS installations with two independent VE.Bus systems sharing a DC bus. A typical arrangement uses a separate grid charger and a separate inverter system supplying the loads.
+An independent package of patches correcting real-time energy flows and historical energy statistics in Victron Venus OS installations with two independent VE.Bus systems sharing a DC bus. A typical arrangement uses a separate grid charger and a separate inverter system supplying the loads. This is not an official Victron Energy product.
 
 Start with [the purpose and limitations](MultiVebusSupport/why-the-patches.en.md). The [package documentation](MultiVebusSupport/GUIDE.md) describes the four fixes, configuration, tested modes and maintenance tools.
 
