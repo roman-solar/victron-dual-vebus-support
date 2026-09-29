@@ -36,7 +36,7 @@ Follow the guide for [verification](MultiVebusSupport/GUIDE.md#verification-afte
 
 ## Validation limits
 
-Active PV generation, generator operation, simultaneous Grid and Generator pass-through, and restoration after an actual Venus OS update remain untested. Historical cross-DC accounting currently covers ordinary VE.Bus services only; a Multi RS system requires adaptation.
+Active PV generation, generator operation, simultaneous Grid and Generator pass-through, and restoration after an actual Venus OS update remain untested. Historical energy accounting for transfers through the shared DC bus currently supports two independent VE.Bus systems. Configurations using a Multi RS, which communicates with the GX device via VE.Can rather than VE.Bus, require adaptation of the accounting algorithm.
 
 A successful compatibility check confirms patch applicability, not correct operation in every system. A meter used for authoritative live consumption must cover all AC loads, including bypass paths.
 
