@@ -1,30 +1,22 @@
 v0.9b4 2026-09-17
 - No energy-accounting algorithm changes from v0.9b2/v0.9b3.
-- Replaced the hard Venus v3.79/exact-SHA install lock with fail-closed structural compatibility checks for later Venus OS versions.
-- Added firstCompatibleVersion v3.79; known hashes now identify actually validated sources rather than the only allowed sources.
-- Unknown upstream files may be patched only with zero fuzz; forward and reverse must succeed, reverse must restore the source byte-for-byte, expected package markers must occur exactly once, and all patched Python must compile.
-- Added tools/preflight.sh for live compatibility checks before installation/reinstallation.
-- Added tools/feature.sh as the supported A/B control for Fix 3 and Fix 4; it updates persistent config and restarts only the required service.
-- Documented that legacy Node-RED/state-file controls are not connected to this package and should be removed after migration.
-- Clarified that a structurally compatible future Venus version is not considered field-validated until regression tests are performed.
+- Replaced the v3.79-only install lock with fail-closed structural compatibility checks for later Venus OS versions; minimum version v3.79.
+- Known hashes identify field-validated sources. Structural compatibility alone does not establish field validation.
+- Added tools/preflight.sh to check source compatibility before installation or reinstallation.
+- Added tools/feature.sh to toggle Fix 3 and Fix 4 in persistent configuration and restart the affected service.
 
 v0.9b3 2026-09-16
 - No energy-accounting algorithm changes from v0.9b2.
-- Added deterministic vrmlogger restart verification after install/uninstall.
-- Made the default configuration fail-safe for reuse on other systems: optional features disabled and no DeviceInstance overrides.
-- Clarified the SetupHelper 9.4 firmware-update reinstall path and fail-closed behavior on unvalidated Venus/source versions.
-- Added a status helper for quick maintenance checks.
-- Moved the one-off manual-patch migration utility under tools/legacy so it is not confused with normal installation.
+- Added a check for a changed vrmlogger process ID after installation and removal; service health must be checked separately.
+- Disabled optional features and left input-role overrides empty in the default configuration for reuse on other systems.
+- Documented SetupHelper 9.4 reinstallation after firmware updates and stopping installation when compatibility checks fail.
+- Added tools/status.sh for maintenance checks.
 
 v0.9b2 2026-09-16
-- Fixed validation on Venus OS: use SetupHelper's full patch utility instead of BusyBox patch.
-- Validation now mirrors SetupHelper forward/reverse patch handling with separate output files.
+- Fixed patch validation on Venus OS by using SetupHelper's full patch utility instead of BusyBox patch, with the installer's forward/reverse handling.
 
 v0.9b1 2026-09-16
-- Consolidated four logical fixes into one SetupHelper package.
-- Removed Node-RED/state-file control for authoritative AC load meter.
-- Moved runtime settings to persistent SetupHelper options config.
-- Removed duplicated VE.Bus input-role logic; Fix 2 and Fix 4 now share one resolver.
-- Clarified cross-VE.Bus matching as sampling-interval based, not globally simultaneous.
-- Added strict v3.79/base-hash validation and Python compile preflight.
-- Documented tested and untested scenarios, Base Load behavior and meter scope requirements.
+- Combined four energy-accounting fixes into one SetupHelper package.
+- Moved runtime settings to persistent SetupHelper configuration, replacing Node-RED/state-file controls.
+- Added v3.79/source-hash checks and Python compilation checks before installation.
+- Documented sampling-interval matching for cross-VE.Bus energy, load-meter scope and tested versus untested scenarios.
