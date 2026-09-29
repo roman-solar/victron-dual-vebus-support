@@ -1,16 +1,16 @@
 # Copyright and third-party notices
 
-Dual VE.Bus Support is an independent package developed by Roman Rubanovich for Victron Venus OS. It is not an official Victron Energy product and is not affiliated with or endorsed by Victron Energy.
+Dual VE.Bus Support is an independent package for Victron Venus OS. It is not an official Victron Energy product and is not affiliated with or endorsed by Victron Energy.
 
 ## Package modifications
 
 Copyright © 2026 Roman Rubanovich
 
-The modifications to the Victron source files, supporting scripts and documentation authored by Roman Rubanovich are licensed under the MIT License. The full terms, including the warranty and liability disclaimer, are in [LICENSE.txt](LICENSE.txt).
+The modifications to the Victron source files, supporting scripts and documentation created for this package are licensed under the MIT License. The full terms, including the warranty and liability disclaimer, are in [LICENSE.txt](LICENSE.txt).
 
 ## Bundled Victron source code
 
-The upstream source code included in this package is also licensed under MIT. Its copyright and licensing information is recorded below. Roman Rubanovich's copyright applies to his contributions; the upstream code retains its existing copyright notices and rightsholders.
+The upstream source code included in this package is also licensed under MIT. Its copyright and licensing information is recorded below. The package author's copyright applies to the package contributions; upstream code retains its existing copyright notices and rightsholders.
 
 Preserve this notice and LICENSE.txt with redistributed copies.
 
