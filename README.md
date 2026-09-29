@@ -44,9 +44,9 @@ A successful compatibility check confirms patch applicability, not correct opera
 
 | Work | Status |
 | --- | --- |
-| Configuration robustness and continuity of historical energy readings | Planned; field tests required before release |
-| Compatibility checks against the actual installer candidate | Planned; field tests required before release |
-| Migration of the GX identifier to `DualVebusSupport`, preserving settings and rollback | Planned; field tests required before release |
+| Configuration robustness and continuity of historical energy readings | Prepared privately; awaiting field tests |
+| Compatibility checks against the actual installer candidate | Prepared privately; awaiting field tests |
+| Migration of the GX identifier to `DualVebusSupport`, preserving settings and rollback | Prepared privately; awaiting field tests |
 | PV, generator, simultaneous sources and firmware-update recovery | Awaiting field tests |
 
 Changes are prepared in private development branches and published after verification. This roadmap describes intended work; it does not promise dates or compatibility with untested configurations.
