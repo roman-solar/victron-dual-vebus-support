@@ -70,24 +70,31 @@ It survives package replacement and Venus OS firmware updates.
 
 The default has optional features disabled and no per-device input overrides. Fix 1 applies when the package is installed; Fix 2 requires an input-role override; Fixes 3 and 4 require their respective switches. Configure the actual topology before enabling optional fixes.
 
-Example for a system with charger DeviceInstance `100` and a full-load meter with DeviceInstance `0`:
+### Tested reference configuration
 
-```json
-{
-  "ac_load_authoritative": {
-    "enabled": true,
-    "device_instance": 0
-  },
-  "vebus_input_overrides": {
-    "100": {
-      "1": 1
-    }
-  },
-  "cross_vebus_passthrough": {
-    "enabled": true
-  }
-}
-```
+[config.reference.json](config.reference.json) contains the package settings used in the documented tests on Venus OS `v3.79` with SetupHelper `9.4`. The installer uses `config.example.json` for initial settings; it does not automatically load the reference file.
+
+The reference installation has two independent VE.Bus systems sharing one DC bus and battery:
+
+- one single-phase MultiPlus-II used as a Grid charger, connected to GX through MK3-USB;
+- three Quattros forming the main three-phase system, connected directly through VE.Bus;
+- all AC loads on the AC-OUT side, with `/Settings/SystemSetup/HasAcInLoads = 0`;
+- main-system AC input 1 assigned to Generator, and AC input 2 assigned to Grid for future use; the separate charger's only AC input is physically connected to Grid.
+
+Separate Victron meters are configured on GX as follows:
+
+| Meter | GX role | Measurement |
+| --- | --- | --- |
+| Grid | Grid | Grid supply to the separate MultiPlus-II charger |
+| Generator | Generator | Generator supply to the Quattro system |
+| All AC loads | AC load | All load circuits, including the external bypass path |
+| PV inverter | PV inverter | AC output of the PV inverter |
+
+The presence of Generator and PV meters does not establish validation with those sources operating. Active PV, generator operation and simultaneous sources remain untested.
+
+The reference JSON enables Fixes 3 and 4, selects full-load meter DeviceInstance `0`, and overrides input `1` of charger DeviceInstance `288` to Grid (role value `1`). Grid, Generator and PV meter roles are configured in GX; they are not additional fields in this JSON. The main Quattro system used DeviceInstance `276` and retained the global input roles.
+
+Before using the file, verify the device instances and meter wiring, adapt the JSON to the actual installation, then save it as `/data/setupOptions/MultiVebusSupport/config.json` following the steps below. Even an identical equipment arrangement may have different device instances. If the topology differs, review each fix; different settings or algorithm adaptation may be required. A meter covering only one branch must not be selected as the full-load meter. Configurations using a Multi RS through VE.Can require adaptation of historical cross-DC accounting.
 
 `ac_load_authoritative.enabled` and `cross_vebus_passthrough.enabled` are diagnostic A/B switches. The configuration is read at process startup.
 
@@ -95,7 +102,7 @@ Example for a system with charger DeviceInstance `100` and a full-load meter wit
 
 From the GX SSH console, run `dbus-spy`, Victron's [D-Bus inspection tool](https://github.com/victronenergy/dbus-spy). Inspect the intended `com.victronenergy.vebus.*` charger and `com.victronenergy.acload.*` meter. Read each service's `/DeviceInstance`, `/ProductName`, `/CustomName` where present, and `/Connected`; compare its live readings with the physical device and wiring. For the meter, verify that all AC loads, including bypass paths, pass through its measurement boundary.
 
-Use the D-Bus `/DeviceInstance` value, not a number inferred from the service name or USB port. The numbers `100` and `0` above are examples. Do not change a device's instance just to match this example.
+Use the D-Bus `/DeviceInstance` value, not a number inferred from the service name or USB port. The numbers `288`, `276` and `0` describe the reference installation. Do not change a device's instance just to match the reference file.
 
 ### Edit and apply the configuration
 

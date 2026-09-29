@@ -1,0 +1,14 @@
+{
+  "ac_load_authoritative": {
+    "enabled": true,
+    "device_instance": 0
+  },
+  "vebus_input_overrides": {
+    "288": {
+      "1": 1
+    }
+  },
+  "cross_vebus_passthrough": {
+    "enabled": true
+  }
+}

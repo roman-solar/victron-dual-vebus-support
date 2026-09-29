@@ -19,7 +19,9 @@ The package corrects live AC consumption, supports an optional meter covering al
 - [SetupHelper](https://github.com/kwindrem/SetupHelper) by Kevin Windrem, installed separately. Version `9.4` was tested; other versions have not been validated for this package. Its files are not bundled.
 - A reviewed system topology and configuration. The default configuration disables the optional features and has no device-specific input-role overrides.
 
-Download the fixed `v0.9b4` snapshot from [Releases](https://github.com/roman-solar/victron-dual-vebus-support/releases/tag/v0.9b4). **Code → Download ZIP** downloads the current `main` branch, whose documentation can change independently of the runtime version.
+The current `main` distribution includes [tested reference settings](MultiVebusSupport/config.reference.json) and [their system topology](MultiVebusSupport/GUIDE.md#tested-reference-configuration), including separate Grid, Generator, full-load and PV-inverter meters. Verify device instances and adapt the settings before use.
+
+Download the fixed `v0.9b4` snapshot from [Releases](https://github.com/roman-solar/victron-dual-vebus-support/releases/tag/v0.9b4). **Code → Download ZIP** downloads the current `main` branch, whose documentation can change independently of the runtime version. The fixed release predates `config.reference.json`; download that file separately when using the fixed snapshot.
 
 A GitHub account is not required to view or download the package.
 
